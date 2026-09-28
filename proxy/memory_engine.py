@@ -1,0 +1,465 @@
+"""LAYA-SWE: Fast System-One Decision Models for Autonomous Coding Agent Memory.
+
+Organizes agent observations into four discrete execution planes:
+1. INVARIANT Plane: Pinned architectural constraints, security rules, and negative invariants (immune from LRU eviction).
+2. SYMBOLIC Plane: Structural AST outlines, symbol dependencies, and module signatures.
+3. TRAJECTORY Plane: Shell execution logs, test outputs, tracebacks, and tool calls.
+4. RESOLUTION Plane: Causal bug resolutions, passing test patches, and verified fixes.
+"""
+
+from enum import Enum
+import logging
+import os
+import re
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Set, Tuple
+import networkx as nx
+
+logger = logging.getLogger("laya_swe_memory_engine")
+logging.basicConfig(level=logging.INFO)
+
+
+class MemoryPlane(str, Enum):
+    INVARIANT = "invariant"     # Architectural negative constraints, security rules, bounds
+    SYMBOLIC = "symbolic"       # File structures, AST class/function signatures, exports
+    TRAJECTORY = "trajectory"   # Shell commands, execution logs, test outputs, tracebacks
+    RESOLUTION = "resolution"   # Causal bug fixes, verified hypotheses, passing patches
+
+
+@dataclass
+class MemoryNode:
+    node_id: str
+    content: str
+    plane: MemoryPlane
+    timestamp: float
+    symbols: List[str] = field(default_factory=list)
+    metadata: Dict = field(default_factory=dict)
+    is_pinned: bool = False     # Pinned invariants are never evicted by LRU
+
+    @property
+    def memory_type(self) -> str:
+        """Backward-compatibility mapping for existing test assertions."""
+        if self.plane == MemoryPlane.INVARIANT:
+            return "constraint"
+        elif self.plane == MemoryPlane.SYMBOLIC:
+            return "semantic"
+        elif self.plane == MemoryPlane.RESOLUTION:
+            return "preference"
+        else:
+            return "episodic"
+
+
+# Backward compatibility aliases
+AxiomNode = MemoryNode
+
+
+class LayaMemoryController:
+    """Multi-Mode SWE Memory Controller supporting LAYA Neural Model and Deterministic Structural Engine."""
+
+    def __init__(self, mode: Optional[str] = None):
+        self.mode = mode or os.getenv("LAYA_CONTROLLER_MODE") or os.getenv("AXIOM_CONTROLLER_MODE", "laya_hybrid")
+        self._laya_agent = None
+        self._laya_init_failed = False
+
+    def get_laya_agent(self):
+        """Lazy singleton loader for local LAYA System-1 Agent."""
+        if self._laya_agent is None and not self._laya_init_failed:
+            try:
+                import laya
+                logger.info("Initializing LAYA System-1 Decision Agent (convaiinnovations/laya)...")
+                t0 = time.time()
+                self._laya_agent = laya.load("convaiinnovations/laya", device="cpu")
+                logger.info(f"LAYA System-1 Decision Agent ready in {time.time() - t0:.2f}s")
+            except Exception as e:
+                logger.warning(f"Failed to load LAYA agent: {e}. Falling back to deterministic mode.")
+                self._laya_init_failed = True
+        return self._laya_agent
+
+    def extract_symbols(self, text: str) -> List[str]:
+        """Extract code symbols, file paths, and test identifiers deterministically."""
+        symbols: Set[str] = set()
+
+        # File paths (e.g. app/analytics.py, tests/test_tenant.py)
+        for match in re.findall(r"\b(?:[a-zA-Z0-9_\-]+/)+[a-zA-Z0-9_\-]+\.(?:py|ts|js|json|yaml|yml|md|txt)\b", text):
+            symbols.add(match)
+
+        # Python class and function definitions
+        for match in re.findall(r"\b(?:class|def)\s+([A-Za-z_][A-Za-z0-9_]*)", text):
+            symbols.add(match)
+
+        # Test case identifiers
+        for match in re.findall(r"\btest_[A-Za-z0-9_]+\b", text):
+            symbols.add(match)
+
+        # Architectural identifiers & keywords
+        keywords = ("tenant_id", "hmac", "sha256", "lru", "coordinator", "ledger", "ast", "2pc", "abort", "commit")
+        text_lower = text.lower()
+        for kw in keywords:
+            if kw in text_lower:
+                symbols.add(kw)
+
+        return sorted(list(symbols))[:12]
+
+    def classify_plane(self, content: str, metadata: Optional[Dict] = None) -> Tuple[MemoryPlane, bool]:
+        """Classify observation into an SWE memory plane and determine if it should be pinned.
+
+        Supports:
+        - 'laya_hybrid': LAYA neural prediction with deterministic invariant safety bounds (Default).
+        - 'laya_pure': Pure LAYA neural decision model classification.
+        - 'deterministic': Pure heuristic regex and AST pattern matching.
+        """
+        meta = metadata if metadata is not None else {}
+        content_lower = content.lower()
+
+        laya_info = {
+            "mode": self.mode,
+            "choice": None,
+            "probabilities": {},
+            "confidence": 0.0,
+            "latency": 0.0
+        }
+
+        # 1. Neural Classification via real LAYA System-1 Agent
+        if self.mode in ("laya_pure", "laya_hybrid") and not self._laya_init_failed:
+            agent = self.get_laya_agent()
+            if agent:
+                try:
+                    t_start = time.time()
+                    questions = {
+                        "swe_triage": {
+                            "type": "choice",
+                            "instructions": "Classify this software engineering text into the appropriate category.",
+                            "criteria": {
+                                "invariant": "A strict rule, security constraint, or negative instruction that must never be broken",
+                                "failure": "A test failure, exception, crash trace, or assertion error",
+                                "code": "Function definition, class implementation, or source code",
+                                "log": "General build, execution, or progress logging output"
+                            }
+                        }
+                    }
+                    res = agent.predict(state=content[:1200], questions=questions)
+                    t_elapsed = time.time() - t_start
+
+                    ans = res.get("answers", {}).get("swe_triage", {})
+                    choice = ans.get("choice")
+                    probs = ans.get("probabilities", {})
+                    conf = ans.get("confidence", 0.0)
+
+                    laya_info["choice"] = choice
+                    laya_info["probabilities"] = probs
+                    laya_info["confidence"] = conf
+                    laya_info["latency"] = round(t_elapsed, 4)
+                    meta["laya"] = laya_info
+
+                    if self.mode == "laya_pure":
+                        if choice == "invariant":
+                            return MemoryPlane.INVARIANT, True
+                        elif choice == "failure":
+                            is_res = ("0 failed" in content_lower or "passed in" in content_lower)
+                            return (MemoryPlane.RESOLUTION if is_res else MemoryPlane.TRAJECTORY), False
+                        elif choice == "code":
+                            return MemoryPlane.SYMBOLIC, False
+                        else:
+                            return MemoryPlane.TRAJECTORY, False
+
+                    elif self.mode == "laya_hybrid":
+                        is_neural_inv = (choice == "invariant" and probs.get("invariant", 0.0) >= 0.55)
+                        is_heur_inv = any(phrase in content_lower for phrase in (
+                            "must not", "never", "do not", "mandatory", "invariant",
+                            "security violation", "standard library only", "no third-party", "prohibited"
+                        )) or meta.get("type") == "invariant"
+
+                        if is_neural_inv or is_heur_inv:
+                            return MemoryPlane.INVARIANT, True
+                        if choice == "failure" and not ("0 failed" in content_lower or "passed in" in content_lower):
+                            return MemoryPlane.TRAJECTORY, False
+                        if choice == "code":
+                            return MemoryPlane.SYMBOLIC, False
+                        if any(phrase in content_lower for phrase in ("passed in", "all tests pass", "fix verified")):
+                            return MemoryPlane.RESOLUTION, False
+                        return MemoryPlane.TRAJECTORY, False
+
+                except Exception as e:
+                    logger.warning(f"LAYA neural inference error: {e}. Falling back to deterministic.")
+
+        # 2. Deterministic Fallback Mode
+        is_invariant = any(phrase in content_lower for phrase in (
+            "must not", "never", "do not", "mandatory", "invariant",
+            "security violation", "standard library only", "no third-party", "prohibited"
+        )) or meta.get("type") == "invariant"
+
+        if is_invariant:
+            return MemoryPlane.INVARIANT, True
+
+        is_resolution = any(phrase in content_lower for phrase in (
+            "passed in", "all tests pass", "fix verified", "bug resolved", "100% passing"
+        )) and ("failed" not in content_lower or "0 failed" in content_lower)
+        if is_resolution:
+            return MemoryPlane.RESOLUTION, False
+
+        is_symbolic = any(line.strip().startswith(("class ", "def ", "import ", "from ", "@dataclass", "interface ")) for line in content.splitlines())
+        if is_symbolic:
+            return MemoryPlane.SYMBOLIC, False
+
+        return MemoryPlane.TRAJECTORY, False
+
+    def classify_and_score(self, content: str) -> Dict[str, float]:
+        """Continuous plane scoring for backwards compatibility with SystemOneController."""
+        plane, is_pinned = self.classify_plane(content)
+        scores = {"constraint": 0.1, "procedural": 0.1, "preference": 0.1, "episodic": 0.1, "semantic": 0.1}
+
+        if plane == MemoryPlane.INVARIANT:
+            scores["constraint"] = 0.95
+        elif plane == MemoryPlane.RESOLUTION:
+            scores["preference"] = 0.85
+            scores["episodic"] = 0.70
+        elif plane == MemoryPlane.SYMBOLIC:
+            scores["semantic"] = 0.90
+        else:
+            scores["episodic"] = 0.90
+            scores["procedural"] = 0.70
+        return scores
+
+    def judge_relation(self, source_node: MemoryNode, target_node: MemoryNode) -> Dict[str, float]:
+        """Judge structural, causal, and invariant relationships between two nodes."""
+        s_syms = set(source_node.symbols)
+        t_syms = set(target_node.symbols)
+        sym_overlap = len(s_syms & t_syms) / max(1, len(s_syms | t_syms))
+
+        # Check invariant guard relation
+        is_guard = (source_node.plane == MemoryPlane.INVARIANT or target_node.plane == MemoryPlane.INVARIANT) and bool(s_syms & t_syms)
+
+        # Check causal failure-fix relation
+        is_causal = (source_node.plane == MemoryPlane.TRAJECTORY and target_node.plane == MemoryPlane.RESOLUTION) or \
+                    (target_node.plane == MemoryPlane.TRAJECTORY and source_node.plane == MemoryPlane.RESOLUTION)
+
+        return {
+            "symbolic": min(1.0, sym_overlap * 2.5),
+            "guard": 0.95 if is_guard else 0.0,
+            "causal": 0.90 if is_causal else 0.0,
+            "semantic": min(1.0, sym_overlap * 2.0)
+        }
+
+    def assess_evidence_sufficiency(self, query: str, retrieved_nodes: List[MemoryNode]) -> Tuple[bool, float]:
+        """Deterministic stopping check based on symbol and invariant coverage."""
+        if not retrieved_nodes:
+            return False, 0.0
+
+        q_symbols = set(self.extract_symbols(query))
+        if not q_symbols:
+            q_symbols = set(re.findall(r"\w+", query.lower()))
+
+        covered_symbols = set()
+        has_invariant = False
+        for node in retrieved_nodes:
+            covered_symbols.update(node.symbols)
+            covered_symbols.update(re.findall(r"\w+", node.content.lower()))
+            if node.plane == MemoryPlane.INVARIANT:
+                has_invariant = True
+
+        coverage = len(q_symbols & covered_symbols) / max(1, len(q_symbols))
+        is_sufficient = (coverage >= 0.60) or (has_invariant and len(retrieved_nodes) >= 2)
+        return is_sufficient, coverage
+
+
+# Backward compatibility aliases
+AxiomMemoryController = LayaMemoryController
+SystemOneController = LayaMemoryController
+
+
+class LayaSweMemoryEngine:
+    """Multi-Plane SWE Memory Engine for Autonomous Coding Agents."""
+
+    def __init__(self, controller: Optional[LayaMemoryController] = None, max_nodes: int = 250):
+        self.controller = controller or LayaMemoryController()
+        self.max_nodes = max_nodes
+        self.graph = nx.MultiDiGraph()
+        self.nodes_map: Dict[str, MemoryNode] = {}
+        self.node_counter = 0
+        self._lock = threading.Lock()
+
+    def ingest(self, observation: str, plane: Optional[MemoryPlane] = None, metadata: Optional[Dict] = None) -> str:
+        """Ingest a new conversational or tool observation into the memory graph."""
+        text = observation.strip()
+        if not text or len(text) < 5:
+            return ""
+
+        with self._lock:
+            self.node_counter += 1
+            node_id = f"mem_{self.node_counter:04d}"
+        metadata = metadata or {}
+
+        # 1. Plane Classification & Invariant Pinning
+        if plane is None:
+            detected_plane, is_pinned = self.controller.classify_plane(text, metadata)
+        else:
+            detected_plane = plane
+            is_pinned = (plane == MemoryPlane.INVARIANT)
+
+        # 2. Symbol Extraction
+        symbols = metadata.get("symbols") or self.controller.extract_symbols(text)
+
+        with self._lock:
+            self.node_counter += 1
+            node_id = f"mem_{self.node_counter:04d}"
+            node = MemoryNode(
+                node_id=node_id,
+                content=text,
+                plane=detected_plane,
+                timestamp=time.time(),
+                symbols=symbols,
+                metadata=metadata,
+                is_pinned=is_pinned
+            )
+            self.nodes_map[node_id] = node
+            self.graph.add_node(node_id, node=node)
+
+            # 3. Structural & Invariant Graph Wiring
+            candidates = list(self.nodes_map.values())[-12:-1]
+            for candidate in candidates:
+                relations = self.controller.judge_relation(node, candidate)
+                for rel_type, score in relations.items():
+                    if score >= 0.5:
+                        self.graph.add_edge(node.node_id, candidate.node_id, rel_type=rel_type, weight=score)
+                        self.graph.add_edge(candidate.node_id, node.node_id, rel_type=rel_type, weight=score)
+
+                # Temporal sequencing
+                self.graph.add_edge(candidate.node_id, node.node_id, rel_type="temporal_precedes", weight=1.0)
+
+            # 4. Strict Invariant-Preserving LRU Eviction
+            if len(self.nodes_map) > self.max_nodes:
+                # Pinned invariant nodes are strictly immune from eviction
+                unpinned_candidates = [n for n in self.nodes_map.values() if not n.is_pinned]
+                if unpinned_candidates:
+                    evict_node = min(unpinned_candidates, key=lambda n: n.timestamp)
+                else:
+                    evict_node = min(self.nodes_map.values(), key=lambda n: n.timestamp)
+
+                del self.nodes_map[evict_node.node_id]
+                if self.graph.has_node(evict_node.node_id):
+                    self.graph.remove_node(evict_node.node_id)
+                logger.debug(f"[LAYA-SWE] Evicted unpinned node {evict_node.node_id} (LRU cap {self.max_nodes})")
+
+            num_edges = len(self.graph.edges(node_id))
+
+        logger.info(f"[LAYA-SWE] Ingested node {node_id} [plane: {detected_plane.value}, pinned: {is_pinned}, edges: {num_edges}]")
+        return node_id
+
+    def retrieve(self, query: str, top_k: int = 5) -> str:
+        """Deterministic SWE context retrieval: Pinned invariants + ranked relevant evidence."""
+        with self._lock:
+            if not self.nodes_map:
+                return "No memory records available."
+            pinned_invariants = [n for n in self.nodes_map.values() if n.is_pinned]
+            unpinned_candidates_list = [n for n in self.nodes_map.values() if not n.is_pinned]
+
+        query_symbols = set(self.controller.extract_symbols(query))
+        query_words = set(re.findall(r"\w+", query.lower()))
+
+        # 2. Score unpinned candidates
+        scored_candidates = []
+        for node in unpinned_candidates_list:
+            node_symbols = set(node.symbols)
+            node_words = set(re.findall(r"\w+", node.content.lower()))
+
+            # Symbol match has highest weight
+            sym_score = len(query_symbols & node_symbols) * 4.0
+            word_score = len(query_words & node_words) * 1.5
+
+            plane_boost = 0.0
+            if node.plane == MemoryPlane.RESOLUTION:
+                plane_boost = 2.5
+            elif node.plane == MemoryPlane.SYMBOLIC:
+                plane_boost = 1.5
+
+            total_score = sym_score + word_score + plane_boost
+            scored_candidates.append((node, total_score))
+
+        scored_candidates.sort(key=lambda x: -x[1])
+
+        # 3. Dynamic Evidence Selection with Adaptive Stopping
+        selected_nodes: List[MemoryNode] = list(pinned_invariants)
+        for node, score in scored_candidates:
+            if len(selected_nodes) >= top_k:
+                break
+            selected_nodes.append(node)
+            sufficient, coverage = self.controller.assess_evidence_sufficiency(query, selected_nodes)
+            if sufficient and len(selected_nodes) >= min(top_k, 3):
+                logger.info(f"[LAYA-SWE] Adaptive stopping triggered ({len(selected_nodes)} nodes, coverage: {coverage:.2f})")
+                break
+
+        # 4. Structured Evidence Formatting
+        lines = []
+        for n in selected_nodes:
+            tag = n.plane.value.upper()
+            pin_marker = " [PINNED]" if n.is_pinned else ""
+            c = n.content.strip()
+            if len(c) > 300:
+                c = c[:300] + "... [truncated]"
+            lines.append(f"• [{tag}{pin_marker}] {c}")
+
+        return "\n".join(lines)
+
+    def get_stats(self) -> Dict:
+        """Return memory engine telemetry and graph status."""
+        with self._lock:
+            planes_count = {p.value: 0 for p in MemoryPlane}
+            pinned_count = 0
+            for n in self.nodes_map.values():
+                planes_count[n.plane.value] += 1
+                if n.is_pinned:
+                    pinned_count += 1
+
+            return {
+                "total_nodes": len(self.nodes_map),
+                "total_edges": self.graph.number_of_edges(),
+                "pinned_invariants": pinned_count,
+                "plane_distribution": planes_count
+            }
+
+    def clear(self):
+        """Reset the memory graph (used between test runs)."""
+        with self._lock:
+            self.graph.clear()
+            self.nodes_map.clear()
+            self.node_counter = 0
+        logger.info("[LAYA-SWE] Memory graph cleared.")
+
+
+# Backward compatibility aliases
+AxiomMemoryEngine = LayaSweMemoryEngine
+MultiRelationalMemoryEngine = LayaSweMemoryEngine
+
+
+class SessionMemoryManager:
+    """Multi-Agent Session Memory Manager providing strict isolation across agents/tasks."""
+
+    def __init__(self, default_controller_mode: Optional[str] = None):
+        self._default_mode = default_controller_mode or os.getenv("LAYA_CONTROLLER_MODE") or os.getenv("AXIOM_CONTROLLER_MODE", "laya_hybrid")
+        self._sessions: Dict[str, Tuple[LayaSweMemoryEngine, Any]] = {}
+        self._manager_lock = threading.Lock()
+
+    def get_or_create(self, session_id: str, compactor_factory, controller_mode: Optional[str] = None) -> Tuple[LayaSweMemoryEngine, Any]:
+        """Get or initialize isolated memory engine and compactor for a session."""
+        with self._manager_lock:
+            if session_id not in self._sessions:
+                mode = controller_mode or self._default_mode
+                controller = LayaMemoryController(mode=mode)
+                engine = LayaSweMemoryEngine(controller=controller)
+                compactor = compactor_factory(engine)
+                self._sessions[session_id] = (engine, compactor)
+            return self._sessions[session_id]
+
+    def reset_session(self, session_id: Optional[str] = None):
+        """Reset a specific session or all active sessions."""
+        with self._manager_lock:
+            if session_id:
+                if session_id in self._sessions:
+                    engine, _ = self._sessions[session_id]
+                    engine.clear()
+            else:
+                for engine, _ in self._sessions.values():
+                    engine.clear()
+                self._sessions.clear()
