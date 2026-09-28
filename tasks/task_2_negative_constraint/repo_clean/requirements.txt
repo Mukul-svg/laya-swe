@@ -1,0 +1,2 @@
+# Zero external dependencies allowed.
+# Standard library only!
