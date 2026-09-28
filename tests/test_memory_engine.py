@@ -167,3 +167,64 @@ def test_graph_edge_traversal_retrieval():
     # Traversal should pull the causal RESOLUTION node along with the failure
     assert "RESOLUTION" in retrieved
     assert "worker_pool.py" in retrieved
+
+
+def test_two_slot_memory_separation():
+    """Verify that privileged invariants and unprivileged evidence are segregated cleanly."""
+    ctrl = LayaMemoryController(mode="deterministic")
+    engine = LayaSweMemoryEngine(controller=ctrl)
+
+    engine.ingest("MANDATORY INVARIANT: Tenant ID is required on all queries.", role="user")
+    engine.ingest("FAILED test_db.py - connection timeout on port 5432", role="tool")
+    engine.ingest("class DatabasePool: def acquire(): pass", role="tool")
+
+    priv, unpriv = engine.retrieve_two_slot("database connection query", top_k=3)
+
+    # Slot 1: Must contain privileged invariant and nothing from tool output
+    assert "Tenant ID is required" in priv
+    assert "MANDATORY INVARIANT" in priv
+    assert "connection timeout" not in priv
+
+    # Slot 2: Must contain unprivileged tool evidence marked as untrusted
+    assert "UNTRUSTED OBSERVATION" in unpriv
+    assert "connection timeout" in unpriv or "DatabasePool" in unpriv
+
+
+def test_invariant_revocation_lifecycle():
+    """Verify that invariants can be explicitly superseded and revoked when constraints relax."""
+    ctrl = LayaMemoryController(mode="deterministic")
+    engine = LayaSweMemoryEngine(controller=ctrl)
+
+    inv_id = engine.ingest("MANDATORY INVARIANT: Under NO circumstance may requirements.txt be modified.", role="user")
+    assert engine.nodes_map[inv_id].is_pinned is True
+
+    # User explicitly relaxes the constraint
+    engine.ingest("You may now allow modifications to requirements.txt for development dependencies.", role="user")
+
+    # Invariant must now be unpinned
+    assert engine.nodes_map[inv_id].is_pinned is False
+
+
+def test_conditioned_causal_edges_require_symbol_or_error_overlap():
+    """Verify that arbitrary unrelated failures do not form spurious causal links with resolutions."""
+    ctrl = LayaMemoryController(mode="deterministic")
+    engine = LayaSweMemoryEngine(controller=ctrl)
+
+    # Ingest unrelated failure in auth module
+    fail_auth = engine.ingest("FAILED tests/test_auth.py::test_jwt - Invalid token signature", role="tool")
+    # Ingest resolution in caching module
+    fix_cache = engine.ingest("RESOLUTION: Reordered mutex acquisition in cache/lru.py. All tests pass.", role="user")
+
+    # Unrelated domains must NOT form a causal edge
+    edge_data = engine.graph.get_edge_data(fail_auth, fix_cache) or {}
+    has_causal = any(data.get("rel_type") == "causal" for data in edge_data.values())
+    assert not has_causal
+
+
+def test_exact_bpe_token_bounding():
+    """Verify that bound_state_tokens slices dense text within the ModernBERT budget."""
+    from proxy.memory_engine import bound_state_tokens
+    long_trace = "AssertionError: file_path_alpha_beta_gamma/test_module.py line 42 " * 80
+    bounded = bound_state_tokens(long_trace, max_tokens=100)
+    assert len(bounded) < len(long_trace)
+    assert "[truncated]" in bounded

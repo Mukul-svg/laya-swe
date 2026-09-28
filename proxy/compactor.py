@@ -117,12 +117,15 @@ class ContextCompactor:
         self,
         memory_engine: MultiRelationalMemoryEngine,
         max_tail_messages: int = 8,
-        cache_friendly_placement: bool = True
+        cache_friendly_placement: bool = True,
+        min_compaction_token_threshold: int = 1500
     ):
         self.memory_engine = memory_engine
         self.max_tail_messages = max_tail_messages
         self.cache_friendly_placement = cache_friendly_placement
+        self.min_compaction_token_threshold = min_compaction_token_threshold
         self._ingested_message_ids = set()
+        self._frozen_compacted_messages: Dict[str, Dict[str, Any]] = {}
 
     def process_and_compact(
         self,
@@ -199,14 +202,20 @@ class ContextCompactor:
                 self.memory_engine.ingest(msg_text, role=msg_role, metadata={"role": msg_role})
                 self._ingested_message_ids.add(msg_key)
 
-        # 4. Auto-Read: Extract active task intent and query System-1 Memory Graph
+        # 4. Auto-Read: Two-Slot Retrieval to prevent context-reconstruction privilege escalation
         active_query = ""
         for m in reversed(history):
             if m.get("role") in ("user", "tool") and m.get("content"):
                 active_query = str(m["content"])[:300]
                 break
 
-        evidence = self.memory_engine.retrieve(active_query or "active task goal", top_k=4)
+        if hasattr(self.memory_engine, "retrieve_two_slot"):
+            priv_invariants, unpriv_evidence = self.memory_engine.retrieve_two_slot(
+                active_query or "active task goal", top_k=4
+            )
+        else:
+            priv_invariants = ""
+            unpriv_evidence = self.memory_engine.retrieve(active_query or "active task goal", top_k=4)
 
         # 5. Safe Tail Slicing (Atomic tool_calls / tool_result Preservation)
         start_idx = max(0, len(history) - self.max_tail_messages)
@@ -215,7 +224,7 @@ class ContextCompactor:
 
         raw_tail = history[start_idx:]
 
-        # Refined Tail Slicing: Recency-Weighted Compaction
+        # Refined Tail Slicing: Recency-Weighted Compaction with Batch-and-Freeze Hysteresis
         tail = []
         num_tail_msgs = len(raw_tail)
 
@@ -244,40 +253,56 @@ class ContextCompactor:
                     else:
                         tail.append(m)
                 else:
-                    # Older intermediate tool result in the tail: compact aggressively
-                    m_copy = dict(m)
-                    m_copy["content"] = compact_tool_output(text, max_chars=400)
-                    tail.append(m_copy)
+                    # Older intermediate tool result in the tail: freeze in cache for stable prefix
+                    freeze_key = f"{m.get('tool_call_id', idx)}:{text[:100]}"
+                    if freeze_key in self._frozen_compacted_messages:
+                        tail.append(self._frozen_compacted_messages[freeze_key])
+                    else:
+                        m_copy = dict(m)
+                        m_copy["content"] = compact_tool_output(text, max_chars=400)
+                        self._frozen_compacted_messages[freeze_key] = m_copy
+                        tail.append(m_copy)
             else:
                 tail.append(m)
 
-        # 6. Assemble Final Compacted Context with Cache-Aware Placement
-        memory_msg = {
-            "role": "system",
-            "content": (
-                "=== LAYA-SWE (SYSTEM-1 MEMORY & EXECUTION CONTEXT) ===\n"
-                f"{evidence}\n"
-                "======================================================"
-            )
-        }
-
+        # 6. Assemble Final Context with Two-Slot Security Model & Cache-Aware Placement
         compacted = []
+
+        # Slot 1: Privileged Invariants attached to System Prompt (Provenance: system/user)
         if system_msg:
             sys_copy = dict(system_msg)
-            sys_copy["content"] = prune_whitespace(str(sys_copy.get("content", "")))
+            sys_text = prune_whitespace(str(sys_copy.get("content", "")))
+            if priv_invariants:
+                sys_text += f"\n\n=== LAYA-SWE SYSTEM-1 MEMORY: PRIVILEGED INVARIANTS ===\n{priv_invariants}\n========================================================"
+            sys_copy["content"] = sys_text
             compacted.append(sys_copy)
+        elif priv_invariants:
+            compacted.append({
+                "role": "system",
+                "content": f"=== LAYA-SWE SYSTEM-1 MEMORY: PRIVILEGED INVARIANTS ===\n{priv_invariants}\n========================================================"
+            })
 
         if root_user_msg:
             compacted.append(root_user_msg)
 
+        # Slot 2: Unprivileged Evidence placed at prompt tail (UNTRUSTED observation data)
+        # Never promoted to system role!
+        context_msg = {
+            "role": "system" if not self.cache_friendly_placement else "user",
+            "content": (
+                "=== LAYA-SWE SYSTEM-1 MEMORY: EXECUTION CONTEXT (OBSERVED TOOL DATA) ===\n"
+                f"{unpriv_evidence or 'No recent observations.'}\n"
+                "========================================================================"
+            )
+        }
+
         if self.cache_friendly_placement:
             # Cache-aware: append tail first, keeping the conversation prefix stable across turns.
-            # Volatile memory context sits at the end, eliminating prefix cache invalidation!
             compacted.extend(tail)
-            compacted.append(memory_msg)
+            compacted.append(context_msg)
         else:
-            # Legacy placement (between root goal and tail)
-            compacted.append(memory_msg)
+            # Legacy placement
+            compacted.append(context_msg)
             compacted.extend(tail)
 
         compacted_tokens = estimate_messages_tokens(compacted)

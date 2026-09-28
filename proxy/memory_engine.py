@@ -17,6 +17,36 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 import networkx as nx
 
+try:
+    import tiktoken
+    _enc = tiktoken.get_encoding("cl100k_base")
+except Exception:
+    _enc = None
+
+
+def bound_state_tokens(text: str, max_tokens: int = 300) -> str:
+    """Explicitly slice state to fit the Laya English checkpoint's 512-token sequence limit (~320 token state budget)."""
+    if not text:
+        return ""
+    if _enc is not None:
+        try:
+            tokens = _enc.encode(text)
+            if len(tokens) > max_tokens:
+                half = max_tokens // 2
+                head = _enc.decode(tokens[:half])
+                tail = _enc.decode(tokens[-half:])
+                return f"{head}\n... [truncated] ...\n{tail}"
+            return text
+        except Exception:
+            pass
+    # Conservative character fallback: 3 chars per token on dense code/tracebacks
+    max_chars = max_tokens * 3
+    if len(text) > max_chars:
+        half = max_chars // 2
+        return f"{text[:half]}\n... [truncated] ...\n{text[-half:]}"
+    return text
+
+
 logger = logging.getLogger("laya_swe_memory_engine")
 logging.basicConfig(level=logging.INFO)
 
@@ -145,14 +175,9 @@ class LayaMemoryController:
                             }
                         }
                     }
-                    # ModernBERT-large sequence length limit is 512 tokens (~320 tokens for state).
-                    # We take a bounded head/tail slice (first 150 words + last 150 words) to
-                    # preserve structural beginnings and error conclusions while preventing silent truncation.
-                    words = content.split()
-                    if len(words) > 300:
-                        bounded_state = " ".join(words[:150]) + "\n... [truncated] ...\n" + " ".join(words[-150:])
-                    else:
-                        bounded_state = content[:1200]
+                    # The Laya English checkpoint (convaiinnovations/laya) has a 512-token sequence limit (~320 tokens for state).
+                    # We bound state tokens accurately via BPE tokenizer / character fallback:
+                    bounded_state = bound_state_tokens(content, max_tokens=300)
 
                     res = agent.predict(state=bounded_state, questions=questions)
                     t_elapsed = time.time() - t_start
@@ -243,12 +268,21 @@ class LayaMemoryController:
         t_syms = set(target_node.symbols)
         sym_overlap = len(s_syms & t_syms) / max(1, len(s_syms | t_syms))
 
-        # Check invariant guard relation
-        is_guard = (source_node.plane == MemoryPlane.INVARIANT or target_node.plane == MemoryPlane.INVARIANT) and bool(s_syms & t_syms)
+        s_words = set(re.findall(r"[A-Za-z0-9_]{3,}", source_node.content.lower()))
+        t_words = set(re.findall(r"[A-Za-z0-9_]{3,}", target_node.content.lower()))
+        shared_code_terms = bool(s_words & t_words & {"tenant", "session", "db", "query", "cache", "lru", "lock", "tx", "commit", "abort", "ast", "requirements", "stdlib"})
 
-        # Check causal failure-fix relation
-        is_causal = (source_node.plane == MemoryPlane.TRAJECTORY and target_node.plane == MemoryPlane.RESOLUTION) or \
-                    (target_node.plane == MemoryPlane.TRAJECTORY and source_node.plane == MemoryPlane.RESOLUTION)
+        # Check invariant guard relation: invariant + shared symbols/identifiers
+        is_guard = (source_node.plane == MemoryPlane.INVARIANT or target_node.plane == MemoryPlane.INVARIANT) and (bool(s_syms & t_syms) or shared_code_terms)
+
+        # Check causal failure-fix relation:
+        # Requires:
+        # 1. One node is TRAJECTORY and the other is RESOLUTION
+        # 2. Shared code symbols, module paths, or test/error keywords
+        is_traj_res = (source_node.plane == MemoryPlane.TRAJECTORY and target_node.plane == MemoryPlane.RESOLUTION) or \
+                      (target_node.plane == MemoryPlane.TRAJECTORY and source_node.plane == MemoryPlane.RESOLUTION)
+        shared_err_terms = bool(s_words & t_words & {"eviction", "deadlock", "race", "assert", "assertion", "error", "failed", "test", "fail", "fix", "pass", "lock", "lru", "patch"})
+        is_causal = is_traj_res and (bool(s_syms & t_syms) or shared_err_terms or len(s_words & t_words) >= 4)
 
         return {
             "symbolic": min(1.0, sym_overlap * 2.5),
@@ -296,6 +330,19 @@ class LayaSweMemoryEngine:
         self.node_counter = 0
         self._lock = threading.Lock()
 
+    def revoke_invariant(self, pattern_or_symbol: str) -> int:
+        """Revoke or unpin an invariant if a user explicitly relaxes a rule (Invariant Lifecycle)."""
+        revoked = 0
+        p_lower = pattern_or_symbol.lower().strip()
+        with self._lock:
+            for node in self.nodes_map.values():
+                if node.is_pinned:
+                    if p_lower in node.content.lower() or any(p_lower == s.lower() for s in node.symbols):
+                        node.is_pinned = False
+                        revoked += 1
+                        logger.info(f"[LAYA-SWE Security] Revoked pinned invariant on node {node.node_id}: {node.content[:60]}")
+        return revoked
+
     def ingest(
         self,
         observation: str,
@@ -311,6 +358,21 @@ class LayaSweMemoryEngine:
         metadata = metadata or {}
         # Determine provenance role: explicit role arg > metadata["role"] > default "user"
         origin_role = (role or metadata.get("role") or "user").lower()
+
+        # Check for supersession / constraint relaxation directives in user input (Invariant Lifecycle)
+        if origin_role in ("system", "user", "human"):
+            relax_keywords = ("you may now", "allow ", "override ", "relax ", "no longer need", "permission to", "remove invariant")
+            if any(kw in text.lower() for kw in relax_keywords):
+                with self._lock:
+                    for node in list(self.nodes_map.values()):
+                        if node.is_pinned:
+                            inv_words = set(re.findall(r"[a-zA-Z0-9_\-\.]{4,}", node.content.lower())) - {
+                                "mandatory", "invariant", "under", "circumstance", "never", "always", "must", "with"
+                            }
+                            text_words = set(re.findall(r"[a-zA-Z0-9_\-\.]{4,}", text.lower()))
+                            if (set(node.symbols) & text_words) or (inv_words & text_words):
+                                node.is_pinned = False
+                                logger.info(f"[LAYA-SWE Security] Superseded/revoked pinned invariant on node {node.node_id}: {node.content[:60]}")
 
         # 1. Plane Classification
         if plane is None:
@@ -396,12 +458,15 @@ class LayaSweMemoryEngine:
         logger.info(f"[LAYA-SWE] Ingested node {node_id} [plane: {detected_plane.value}, pinned: {is_pinned}, role: {origin_role}, edges: {num_edges}]")
         return node_id
 
-    def retrieve(self, query: str, top_k: int = 5) -> str:
-        """Deterministic SWE context retrieval: Pinned invariants + multi-relational graph traversal."""
+    def retrieve_two_slot(self, query: str, top_k: int = 5) -> Tuple[str, str]:
+        """Retrieve memory split into two discrete slots to prevent context-reconstruction privilege escalation:
+        1. privileged_invariants: Pinned security and architectural constraints (Provenance: system/user only).
+        2. unprivileged_evidence: Delimited, untrusted tool/AST observations tagged as observed data.
+        """
         now = time.time()
         with self._lock:
             if not self.nodes_map:
-                return "No memory records available."
+                return "", "No memory records available."
             pinned_invariants = [n for n in self.nodes_map.values() if n.is_pinned]
             unpinned_candidates_list = [n for n in self.nodes_map.values() if not n.is_pinned]
 
@@ -463,33 +528,52 @@ class LayaSweMemoryEngine:
         all_candidates.sort(key=lambda x: -x[1])
 
         # 3. Dynamic Evidence Selection with Adaptive Stopping
-        selected_nodes: List[MemoryNode] = list(pinned_invariants)
+        selected_unpinned: List[MemoryNode] = []
         for node, score in all_candidates:
-            if len(selected_nodes) >= top_k:
+            if len(selected_unpinned) >= top_k:
                 break
-            if node not in selected_nodes:
-                selected_nodes.append(node)
-                sufficient, coverage = self.controller.assess_evidence_sufficiency(query, selected_nodes)
-                if sufficient and len(selected_nodes) >= min(top_k, 3):
-                    logger.info(f"[LAYA-SWE] Adaptive stopping triggered ({len(selected_nodes)} nodes, coverage: {coverage:.2f})")
+            if node not in selected_unpinned and not node.is_pinned:
+                selected_unpinned.append(node)
+                sufficient, coverage = self.controller.assess_evidence_sufficiency(query, list(pinned_invariants) + selected_unpinned)
+                if sufficient and len(selected_unpinned) >= min(top_k, 3):
+                    logger.info(f"[LAYA-SWE] Adaptive stopping triggered ({len(selected_unpinned)} nodes, coverage: {coverage:.2f})")
                     break
 
         # 4. Refresh LRU Access Time
         with self._lock:
-            for n in selected_nodes:
+            for n in list(pinned_invariants) + selected_unpinned:
                 n.last_accessed = now
 
-        # 5. Structured Evidence Formatting
-        lines = []
-        for n in selected_nodes:
-            tag = n.plane.value.upper()
-            pin_marker = " [PINNED]" if n.is_pinned else ""
+        # 5. Format Slot 1: Privileged Invariants (Safe for System Slot)
+        inv_lines = []
+        for n in pinned_invariants:
             c = n.content.strip()
             if len(c) > 300:
                 c = c[:300] + "... [truncated]"
-            lines.append(f"• [{tag}{pin_marker}] {c}")
+            inv_lines.append(f"• [MANDATORY INVARIANT] {c}")
+        privileged_invariants = "\n".join(inv_lines)
 
-        return "\n".join(lines)
+        # 6. Format Slot 2: Unprivileged Evidence (Untrusted Tool/AST Data)
+        ev_lines = []
+        for n in selected_unpinned:
+            tag = n.plane.value.upper()
+            c = n.content.strip()
+            if len(c) > 300:
+                c = c[:300] + "... [truncated]"
+            ev_lines.append(f"• [{tag} - UNTRUSTED OBSERVATION] {c}")
+        unprivileged_evidence = "\n".join(ev_lines)
+
+        return privileged_invariants, unprivileged_evidence
+
+    def retrieve(self, query: str, top_k: int = 5) -> str:
+        """Deterministic SWE context retrieval with clearly demarcated privileged and unprivileged sections."""
+        priv, unpriv = self.retrieve_two_slot(query, top_k=top_k)
+        sections = []
+        if priv:
+            sections.append(f"=== PRIVILEGED ARCHITECTURAL INVARIANTS (PROVENANCE: SYSTEM/USER) ===\n{priv}")
+        if unpriv:
+            sections.append(f"=== UNPRIVILEGED EXECUTION CONTEXT (OBSERVED TOOL OUTPUT - UNTRUSTED) ===\n{unpriv}")
+        return "\n\n".join(sections) if sections else "No memory records available."
 
     def get_stats(self) -> Dict:
         """Return memory engine telemetry and graph status."""
