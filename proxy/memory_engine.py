@@ -37,6 +37,12 @@ class MemoryNode:
     symbols: List[str] = field(default_factory=list)
     metadata: Dict = field(default_factory=dict)
     is_pinned: bool = False     # Pinned invariants are never evicted by LRU
+    last_accessed: float = 0.0  # Unix timestamp for true LRU eviction
+    role: str = "tool"          # Provenance origin role (system, user, tool, assistant)
+
+    def __post_init__(self):
+        if not self.last_accessed:
+            self.last_accessed = self.timestamp
 
     @property
     def memory_type(self) -> str:
@@ -139,7 +145,16 @@ class LayaMemoryController:
                             }
                         }
                     }
-                    res = agent.predict(state=content[:1200], questions=questions)
+                    # ModernBERT-large sequence length limit is 512 tokens (~320 tokens for state).
+                    # We take a bounded head/tail slice (first 150 words + last 150 words) to
+                    # preserve structural beginnings and error conclusions while preventing silent truncation.
+                    words = content.split()
+                    if len(words) > 300:
+                        bounded_state = " ".join(words[:150]) + "\n... [truncated] ...\n" + " ".join(words[-150:])
+                    else:
+                        bounded_state = content[:1200]
+
+                    res = agent.predict(state=bounded_state, questions=questions)
                     t_elapsed = time.time() - t_start
 
                     ans = res.get("answers", {}).get("swe_triage", {})
@@ -272,51 +287,86 @@ SystemOneController = LayaMemoryController
 class LayaSweMemoryEngine:
     """Multi-Plane SWE Memory Engine for Autonomous Coding Agents."""
 
-    def __init__(self, controller: Optional[LayaMemoryController] = None, max_nodes: int = 250):
+    def __init__(self, controller: Optional[LayaMemoryController] = None, max_nodes: int = 250, max_pinned: int = 15):
         self.controller = controller or LayaMemoryController()
         self.max_nodes = max_nodes
+        self.max_pinned = max_pinned
         self.graph = nx.MultiDiGraph()
         self.nodes_map: Dict[str, MemoryNode] = {}
         self.node_counter = 0
         self._lock = threading.Lock()
 
-    def ingest(self, observation: str, plane: Optional[MemoryPlane] = None, metadata: Optional[Dict] = None) -> str:
-        """Ingest a new conversational or tool observation into the memory graph."""
+    def ingest(
+        self,
+        observation: str,
+        plane: Optional[MemoryPlane] = None,
+        metadata: Optional[Dict] = None,
+        role: Optional[str] = None
+    ) -> str:
+        """Ingest a new conversational or tool observation into the memory graph with provenance gating."""
         text = observation.strip()
         if not text or len(text) < 5:
             return ""
 
-        with self._lock:
-            self.node_counter += 1
-            node_id = f"mem_{self.node_counter:04d}"
         metadata = metadata or {}
+        # Determine provenance role: explicit role arg > metadata["role"] > default "user"
+        origin_role = (role or metadata.get("role") or "user").lower()
 
-        # 1. Plane Classification & Invariant Pinning
+        # 1. Plane Classification
         if plane is None:
-            detected_plane, is_pinned = self.controller.classify_plane(text, metadata)
+            detected_plane, candidate_pinned = self.controller.classify_plane(text, metadata)
         else:
             detected_plane = plane
-            is_pinned = (plane == MemoryPlane.INVARIANT)
+            candidate_pinned = (plane == MemoryPlane.INVARIANT)
 
-        # 2. Symbol Extraction
-        symbols = metadata.get("symbols") or self.controller.extract_symbols(text)
+        # 2. Provenance-Gated Pinning Security ("When Context Gets Root" Mitigation)
+        # Strict Rule: Untrusted tool output can NEVER be pinned as an invariant,
+        # preventing privilege escalation via adversarial tool results.
+        if origin_role not in ("system", "user", "human"):
+            is_pinned = False
+            if detected_plane == MemoryPlane.INVARIANT:
+                detected_plane = MemoryPlane.TRAJECTORY
+                text = f"[OBSERVED TOOL OUTPUT] {text}"
+        else:
+            is_pinned = candidate_pinned
 
+        # 3. Invariant Deduplication & Hard Pin Cap
         with self._lock:
+            if is_pinned:
+                norm_text = re.sub(r"\s+", " ", text.lower().strip())
+                for existing_node in self.nodes_map.values():
+                    if existing_node.is_pinned:
+                        existing_norm = re.sub(r"\s+", " ", existing_node.content.lower().strip())
+                        if norm_text == existing_norm or norm_text in existing_norm:
+                            existing_node.last_accessed = time.time()
+                            return existing_node.node_id
+
+                current_pinned = [n for n in self.nodes_map.values() if n.is_pinned]
+                if len(current_pinned) >= self.max_pinned:
+                    is_pinned = False
+                    logger.warning(f"[LAYA-SWE Security] Pinned invariant cap ({self.max_pinned}) reached; ingesting as unpinned.")
+
             self.node_counter += 1
             node_id = f"mem_{self.node_counter:04d}"
+
+            # 4. Symbol Extraction
+            symbols = metadata.get("symbols") or self.controller.extract_symbols(text)
+            now = time.time()
             node = MemoryNode(
                 node_id=node_id,
                 content=text,
                 plane=detected_plane,
-                timestamp=time.time(),
+                timestamp=now,
                 symbols=symbols,
                 metadata=metadata,
-                is_pinned=is_pinned
+                is_pinned=is_pinned,
+                last_accessed=now,
+                role=origin_role
             )
             self.nodes_map[node_id] = node
             self.graph.add_node(node_id, node=node)
 
-            # 3. Structural & Invariant Graph Wiring
+            # 5. Structural & Invariant Graph Wiring
             candidates = list(self.nodes_map.values())[-12:-1]
             for candidate in candidates:
                 relations = self.controller.judge_relation(node, candidate)
@@ -328,27 +378,27 @@ class LayaSweMemoryEngine:
                 # Temporal sequencing
                 self.graph.add_edge(candidate.node_id, node.node_id, rel_type="temporal_precedes", weight=1.0)
 
-            # 4. Strict Invariant-Preserving LRU Eviction
+            # 6. True LRU Eviction (access-time weighted)
             if len(self.nodes_map) > self.max_nodes:
-                # Pinned invariant nodes are strictly immune from eviction
                 unpinned_candidates = [n for n in self.nodes_map.values() if not n.is_pinned]
                 if unpinned_candidates:
-                    evict_node = min(unpinned_candidates, key=lambda n: n.timestamp)
+                    evict_node = min(unpinned_candidates, key=lambda n: n.last_accessed)
                 else:
-                    evict_node = min(self.nodes_map.values(), key=lambda n: n.timestamp)
+                    evict_node = min(self.nodes_map.values(), key=lambda n: n.last_accessed)
 
                 del self.nodes_map[evict_node.node_id]
                 if self.graph.has_node(evict_node.node_id):
                     self.graph.remove_node(evict_node.node_id)
-                logger.debug(f"[LAYA-SWE] Evicted unpinned node {evict_node.node_id} (LRU cap {self.max_nodes})")
+                logger.debug(f"[LAYA-SWE] Evicted unpinned node {evict_node.node_id} (True LRU cap {self.max_nodes})")
 
             num_edges = len(self.graph.edges(node_id))
 
-        logger.info(f"[LAYA-SWE] Ingested node {node_id} [plane: {detected_plane.value}, pinned: {is_pinned}, edges: {num_edges}]")
+        logger.info(f"[LAYA-SWE] Ingested node {node_id} [plane: {detected_plane.value}, pinned: {is_pinned}, role: {origin_role}, edges: {num_edges}]")
         return node_id
 
     def retrieve(self, query: str, top_k: int = 5) -> str:
-        """Deterministic SWE context retrieval: Pinned invariants + ranked relevant evidence."""
+        """Deterministic SWE context retrieval: Pinned invariants + multi-relational graph traversal."""
+        now = time.time()
         with self._lock:
             if not self.nodes_map:
                 return "No memory records available."
@@ -358,39 +408,78 @@ class LayaSweMemoryEngine:
         query_symbols = set(self.controller.extract_symbols(query))
         query_words = set(re.findall(r"\w+", query.lower()))
 
-        # 2. Score unpinned candidates
+        # 1. Score unpinned candidates
         scored_candidates = []
         for node in unpinned_candidates_list:
             node_symbols = set(node.symbols)
             node_words = set(re.findall(r"\w+", node.content.lower()))
 
-            # Symbol match has highest weight
             sym_score = len(query_symbols & node_symbols) * 4.0
             word_score = len(query_words & node_words) * 1.5
 
-            plane_boost = 0.0
-            if node.plane == MemoryPlane.RESOLUTION:
-                plane_boost = 2.5
-            elif node.plane == MemoryPlane.SYMBOLIC:
-                plane_boost = 1.5
+            if sym_score > 0 or word_score > 0:
+                plane_boost = 0.0
+                if node.plane == MemoryPlane.RESOLUTION:
+                    plane_boost = 2.5
+                elif node.plane == MemoryPlane.SYMBOLIC:
+                    plane_boost = 1.5
+                total_score = sym_score + word_score + plane_boost
+                scored_candidates.append((node, total_score))
 
-            total_score = sym_score + word_score + plane_boost
-            scored_candidates.append((node, total_score))
+        # Fallback if query had no keyword matches and no pinned invariants exist
+        if not scored_candidates and not pinned_invariants:
+            scored_candidates = [(node, 0.1) for node in unpinned_candidates_list[-top_k:]]
 
         scored_candidates.sort(key=lambda x: -x[1])
 
+        # 2. Multi-Relational Graph Edge Traversal
+        visited_ids = {n.node_id for n in pinned_invariants}
+        traversed_boosted: List[Tuple[MemoryNode, float]] = []
+
+        with self._lock:
+            top_seed_nodes = [node for node, score in scored_candidates[:3]]
+            for seed_node in top_seed_nodes:
+                visited_ids.add(seed_node.node_id)
+                if self.graph.has_node(seed_node.node_id):
+                    for neighbor_id in self.graph.neighbors(seed_node.node_id):
+                        if neighbor_id in visited_ids:
+                            continue
+                        neighbor = self.nodes_map.get(neighbor_id)
+                        if not neighbor:
+                            continue
+                        edge_data = self.graph.get_edge_data(seed_node.node_id, neighbor_id) or {}
+                        for edge in edge_data.values():
+                            rel = edge.get("rel_type")
+                            if rel == "causal" and neighbor.plane == MemoryPlane.RESOLUTION:
+                                traversed_boosted.append((neighbor, 8.0))
+                                visited_ids.add(neighbor_id)
+                                break
+                            elif rel == "guard" and neighbor.plane == MemoryPlane.INVARIANT:
+                                traversed_boosted.append((neighbor, 7.0))
+                                visited_ids.add(neighbor_id)
+                                break
+
+        all_candidates = traversed_boosted + scored_candidates
+        all_candidates.sort(key=lambda x: -x[1])
+
         # 3. Dynamic Evidence Selection with Adaptive Stopping
         selected_nodes: List[MemoryNode] = list(pinned_invariants)
-        for node, score in scored_candidates:
+        for node, score in all_candidates:
             if len(selected_nodes) >= top_k:
                 break
-            selected_nodes.append(node)
-            sufficient, coverage = self.controller.assess_evidence_sufficiency(query, selected_nodes)
-            if sufficient and len(selected_nodes) >= min(top_k, 3):
-                logger.info(f"[LAYA-SWE] Adaptive stopping triggered ({len(selected_nodes)} nodes, coverage: {coverage:.2f})")
-                break
+            if node not in selected_nodes:
+                selected_nodes.append(node)
+                sufficient, coverage = self.controller.assess_evidence_sufficiency(query, selected_nodes)
+                if sufficient and len(selected_nodes) >= min(top_k, 3):
+                    logger.info(f"[LAYA-SWE] Adaptive stopping triggered ({len(selected_nodes)} nodes, coverage: {coverage:.2f})")
+                    break
 
-        # 4. Structured Evidence Formatting
+        # 4. Refresh LRU Access Time
+        with self._lock:
+            for n in selected_nodes:
+                n.last_accessed = now
+
+        # 5. Structured Evidence Formatting
         lines = []
         for n in selected_nodes:
             tag = n.plane.value.upper()

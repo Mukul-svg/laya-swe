@@ -17,13 +17,14 @@ export default function (pi: ExtensionAPI) {
       const toolName = event.toolName;
       const resultText = typeof event.result === "string" ? event.result : JSON.stringify(event.result);
       if (resultText && resultText.length > 20) {
-        // Send asynchronously to background LAYA-SWE engine
+        // Send asynchronously to background LAYA-SWE engine with explicit tool provenance
         fetch(`${PROXY_URL}/ingest`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             observation: `[TOOL ${toolName}]: ${resultText.slice(0, 1000)}`,
-            metadata: { tool: toolName, cwd: ctx.cwd }
+            metadata: { tool: toolName, cwd: ctx.cwd, role: "tool" },
+            role: "tool"
           })
         }).catch(() => {});
       }
@@ -81,8 +82,9 @@ export default function (pi: ExtensionAPI) {
         }
         const tail = messages.slice(startIdx);
 
+        // Cache-friendly: keep prefix stable, place volatile memory block at the end
         return {
-          messages: [...prefix, memoryMessage, ...tail]
+          messages: [...prefix, ...tail, memoryMessage]
         };
       }
     } catch (e) {

@@ -113,9 +113,15 @@ def compact_tool_output(content: str, max_chars: int = 900) -> str:
 
 
 class ContextCompactor:
-    def __init__(self, memory_engine: MultiRelationalMemoryEngine, max_tail_messages: int = 8):
+    def __init__(
+        self,
+        memory_engine: MultiRelationalMemoryEngine,
+        max_tail_messages: int = 8,
+        cache_friendly_placement: bool = True
+    ):
         self.memory_engine = memory_engine
         self.max_tail_messages = max_tail_messages
+        self.cache_friendly_placement = cache_friendly_placement
         self._ingested_message_ids = set()
 
     def process_and_compact(
@@ -157,34 +163,40 @@ class ContextCompactor:
         if len(history) <= self.max_tail_messages:
             return messages, raw_tokens, raw_tokens
 
-        # 2. Ingest Root User Objective into System-1 Memory Graph
+        # 2. Ingest Root User Objective into System-1 Memory Graph (Provenance: 'user')
         if root_user_msg:
             u_content = root_user_msg.get("content") or ""
             u_key = f"user:{u_content[:60]}"
             if u_key not in self._ingested_message_ids and len(str(u_content).strip()) > 10:
-                self.memory_engine.ingest(f"[USER GOAL]: {u_content}")
+                self.memory_engine.ingest(
+                    f"[USER GOAL]: {u_content}",
+                    role="user",
+                    metadata={"role": "user"}
+                )
                 self._ingested_message_ids.add(u_key)
 
-        # 3. Auto-Write & Observation Virtualization for Older Turns
+        # 3. Auto-Write & Observation Virtualization for Older Turns (Provenance-Gated)
         older_turns = history[:-self.max_tail_messages]
         for idx, m in enumerate(older_turns):
             role = m.get("role", "unknown")
             content = m.get("content")
             content_str = str(content) if content is not None else ""
 
-            # If tool result in historical turn, compress it before memory ingestion
             if role == "tool":
                 compacted_obs = compact_tool_output(content_str, max_chars=400)
-                msg_text = f"[TOOL]: {compacted_obs}"
+                msg_text = f"[OBSERVED TOOL OUTPUT]: {compacted_obs}"
+                msg_role = "tool"
             elif role == "assistant" and m.get("tool_calls"):
                 fn_names = [tc.get("function", {}).get("name", "") for tc in m.get("tool_calls", [])]
                 msg_text = f"[ACTION]: Called {', '.join(fn_names)}"
+                msg_role = "assistant"
             else:
                 msg_text = f"[{role.upper()}]: {content_str[:400]}"
+                msg_role = role
 
             msg_key = f"{role}:{msg_text[:60]}"
             if msg_key not in self._ingested_message_ids and len(msg_text.strip()) > 15:
-                self.memory_engine.ingest(msg_text)
+                self.memory_engine.ingest(msg_text, role=msg_role, metadata={"role": msg_role})
                 self._ingested_message_ids.add(msg_key)
 
         # 4. Auto-Read: Extract active task intent and query System-1 Memory Graph
@@ -204,12 +216,9 @@ class ContextCompactor:
         raw_tail = history[start_idx:]
 
         # Refined Tail Slicing: Recency-Weighted Compaction
-        # - The immediate active tool result (most recent) is preserved with high fidelity.
-        # - Intermediate tool results in the tail from prior turns are semantically compacted.
         tail = []
         num_tail_msgs = len(raw_tail)
 
-        # Identify index of the last assistant message in raw_tail
         last_asst_idx = -1
         for i in range(num_tail_msgs - 1, -1, -1):
             if raw_tail[i].get("role") == "assistant":
@@ -242,7 +251,7 @@ class ContextCompactor:
             else:
                 tail.append(m)
 
-        # 6. Assemble Final Compacted Context
+        # 6. Assemble Final Compacted Context with Cache-Aware Placement
         memory_msg = {
             "role": "system",
             "content": (
@@ -254,7 +263,6 @@ class ContextCompactor:
 
         compacted = []
         if system_msg:
-            # Clean system message whitespace
             sys_copy = dict(system_msg)
             sys_copy["content"] = prune_whitespace(str(sys_copy.get("content", "")))
             compacted.append(sys_copy)
@@ -262,8 +270,15 @@ class ContextCompactor:
         if root_user_msg:
             compacted.append(root_user_msg)
 
-        compacted.append(memory_msg)
-        compacted.extend(tail)
+        if self.cache_friendly_placement:
+            # Cache-aware: append tail first, keeping the conversation prefix stable across turns.
+            # Volatile memory context sits at the end, eliminating prefix cache invalidation!
+            compacted.extend(tail)
+            compacted.append(memory_msg)
+        else:
+            # Legacy placement (between root goal and tail)
+            compacted.append(memory_msg)
+            compacted.extend(tail)
 
         compacted_tokens = estimate_messages_tokens(compacted)
         return compacted, raw_tokens, compacted_tokens

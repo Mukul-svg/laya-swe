@@ -78,6 +78,7 @@ stats = {
     "total_raw_tokens": 0,
     "total_sent_tokens": 0,
     "total_tokens_saved": 0,
+    "total_cached_tokens": 0,
     "runs": []
 }
 
@@ -116,7 +117,15 @@ def _append_telemetry_file(entry_dict: dict):
         f.write(json.dumps(entry_dict) + "\n")
 
 
-async def record_telemetry(task_id: str, compaction: bool, raw_tok: int, sent_tok: int, duration_s: float, upstream_model: str = "openai/gpt-oss-120b"):
+async def record_telemetry(
+    task_id: str,
+    compaction: bool,
+    raw_tok: int,
+    sent_tok: int,
+    duration_s: float,
+    upstream_model: str = "openai/gpt-oss-120b",
+    cached_tokens: int = 0
+):
     saved_tok = max(0, raw_tok - sent_tok)
     entry = {
         "timestamp": time.time(),
@@ -128,6 +137,8 @@ async def record_telemetry(task_id: str, compaction: bool, raw_tok: int, sent_to
         "sent_prompt_tokens": sent_tok,
         "tokens_saved": saved_tok,
         "savings_percentage": round((saved_tok / max(1, raw_tok)) * 100, 2),
+        "cached_tokens": cached_tokens,
+        "cache_hit_rate": round((cached_tokens / max(1, sent_tok)) * 100, 2),
         "latency_seconds": round(duration_s, 3)
     }
     async with stats_lock:
@@ -135,12 +146,14 @@ async def record_telemetry(task_id: str, compaction: bool, raw_tok: int, sent_to
         stats["total_raw_tokens"] += raw_tok
         stats["total_sent_tokens"] += sent_tok
         stats["total_tokens_saved"] += saved_tok
+        stats.setdefault("total_cached_tokens", 0)
+        stats["total_cached_tokens"] += cached_tokens
         stats["runs"].append(entry)
 
     async with telemetry_lock:
         await asyncio.to_thread(_append_telemetry_file, entry)
 
-    logger.info(f"[Telemetry] Task: {task_id} | Model: {upstream_model} | Mode: {entry['mode']} | Raw: {raw_tok} | Sent: {sent_tok} | Saved: {saved_tok} ({entry['savings_percentage']}%)")
+    logger.info(f"[Telemetry] Task: {task_id} | Model: {upstream_model} | Mode: {entry['mode']} | Raw: {raw_tok} | Sent: {sent_tok} | Saved: {saved_tok} ({entry['savings_percentage']}%) | Cached: {cached_tokens}")
 
 
 @app.get("/health")
@@ -191,7 +204,8 @@ async def ingest_observation(request: Request):
         data = {}
     obs = data.get("observation", "")
     metadata = data.get("metadata", {})
-    node_id = memory_engine.ingest(obs, metadata=metadata)
+    role = data.get("role") or metadata.get("role")
+    node_id = memory_engine.ingest(obs, metadata=metadata, role=role)
     return {"status": "ok", "node_id": node_id}
 
 
@@ -375,7 +389,23 @@ async def chat_completions(request: Request):
             return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
 
         upstream_model_executed = data.get("model", upstream_body.get("model", "unknown"))
-        await record_telemetry(task_id, enable_compaction, raw_tok, sent_tok, duration, upstream_model=upstream_model_executed)
+        usage_data = data.get("usage", {})
+        prompt_details = usage_data.get("prompt_tokens_details", {})
+        cached_tok = 0
+        if isinstance(prompt_details, dict):
+            cached_tok = prompt_details.get("cached_tokens", 0)
+        if not cached_tok:
+            cached_tok = usage_data.get("cached_tokens", 0)
+
+        await record_telemetry(
+            task_id,
+            enable_compaction,
+            raw_tok,
+            sent_tok,
+            duration,
+            upstream_model=upstream_model_executed,
+            cached_tokens=cached_tok
+        )
 
         try:
             for choice in data.get("choices", []):
