@@ -1,0 +1,9 @@
+fastapi>=0.100.0
+uvicorn>=0.23.0
+httpx>=0.24.0
+networkx>=3.0
+numpy>=1.24.0
+pytest>=8.0.0
+tiktoken>=0.5.0
+# Optional for local neural System-1 model serving:
+# laya[serve]

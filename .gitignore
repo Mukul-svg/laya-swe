@@ -1,0 +1,32 @@
+# Environment & Secrets
+.env
+*.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+**/.pytest_cache/
+.coverage
+htmlcov/
+.vent/
+venv/
+.venv/
+env/
+
+# Pi & Agent Run Artifacts
+.pi/
+*.log
+benchmark_telemetry.historical.jsonl
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
