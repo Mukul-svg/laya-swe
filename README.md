@@ -8,7 +8,9 @@
 
 During multi-step debugging and repository modification, coding agents accumulate thousands of lines of terminal dumps, tracebacks, and code reads. Naive context truncation often discards non-negotiable architectural invariants or breaks API tool-calling protocols. LAYA-SWE triages observations into distinct memory planes in a single forward pass, pinning architectural invariants and compacting intermediate execution logs while preserving tool-call schemas.
 
-Read the technical manuscript: [**`LAYA_SWE_RESEARCH_PAPER.md`**](LAYA_SWE_RESEARCH_PAPER.md)
+Read the documentation:
+- **Technical Manuscript:** [`LAYA_SWE_RESEARCH_PAPER.md`](LAYA_SWE_RESEARCH_PAPER.md)
+- **Architecture Specification:** [`ARCHITECTURE.md`](ARCHITECTURE.md)
 
 ---
 
@@ -99,6 +101,7 @@ python run_autoresearch_benchmark.py
 │   └── verify_scaling_law.py       # Compaction scaling simulator
 ├── extensions/                     # Agent extension hooks
 │   └── laya-swe.ts                 # Native lifecycle hook for coding agents
+├── ARCHITECTURE.md                 # In-depth technical architecture specification
 ├── LAYA_SWE_RESEARCH_PAPER.md       # Full academic manuscript / technical report
 ├── run_autoresearch_benchmark.py   # 4-candidate comparative benchmark runner
 ├── autoresearch_results.json       # Persisted empirical benchmark scorecard
